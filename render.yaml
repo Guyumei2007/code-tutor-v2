@@ -1,0 +1,22 @@
+# Render 蓝图：仓库推到 GitHub 后，在 Render 选 New -> Blueprint 即可一键部署
+services:
+  - type: web
+    name: code-tutor
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: NO_BROWSER
+        value: "1"
+      - key: LLM_BASE_URL
+        value: https://api.deepseek.com/v1
+      - key: LLM_MODEL
+        value: deepseek-chat
+      # 大模型密钥在 Render 控制台手动填，不写进仓库
+      - key: LLM_API_KEY
+        sync: false

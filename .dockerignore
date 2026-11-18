@@ -1,0 +1,24 @@
+# 含密钥，绝不进镜像
+config.json
+config.example.json
+
+# 本地运行时产物
+__pycache__/
+*.py[cod]
+data/
+workspace/
+tests/
+tools/
+*.log
+server.out.log
+server.err.log
+start_public.ps1
+
+# 版本控制/编辑器
+.git/
+.gitignore
+.vscode/
+.idea/
+.venv/
+venv/
+.DS_Store

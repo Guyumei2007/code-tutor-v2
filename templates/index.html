@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>编程报错检查助手 · CodeFix Buddy</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">&lt;/&gt;</div>
+    <div class="brand-text">
+      <h1>编程报错检查助手</h1>
+      <span>代码先真跑一遍 · 再告诉你哪里错 · 最后修到能跑通</span>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <div class="badges" id="envBadges"></div>
+    <button class="btn ghost" id="btnMistakes">错题集 <span class="count-pill" id="mkCountPill">0</span></button>
+    <button class="btn ghost" id="btnSettings">设置</button>
+    <button class="btn ghost" id="btnKnowledge">报错百科</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ============ 左侧：输入区 ============ -->
+  <section class="pane pane-input">
+    <div class="pane-head">
+      <div class="row">
+        <select id="language" class="select">
+          <option value="auto">自动识别语言</option>
+          <option value="python">Python</option>
+          <option value="c">C 语言</option>
+          <option value="cpp">C++</option>
+        </select>
+        <select id="sampleSelect" class="select">
+          <option value="">加载示例...</option>
+        </select>
+      </div>
+      <div class="row">
+        <span class="hint">Ctrl + Enter 快速检查</span>
+        <button class="btn ghost small" id="btnClear">清空</button>
+      </div>
+    </div>
+
+    <div class="desc-box">
+      <label for="desc">这段代码要做什么？<span class="opt">可选</span></label>
+      <input type="text" id="desc" maxlength="300" spellcheck="false"
+        placeholder="例如：输入若干个数，求它们的平均值，保留 2 位小数">
+      <p class="hint">填了会按你写的描述核对代码是否真的做到；不填则自动根据代码判断。</p>
+    </div>
+
+    <div class="editor-wrap">
+      <div class="gutter" id="gutter">1</div>
+      <textarea id="code" spellcheck="false" placeholder="把你的代码粘贴到这里……
+比如一段跑不起来的 Python 或 C 语言程序。
+
+提示：不用先自己找错误，直接原样贴过来就行。"></textarea>
+    </div>
+
+    <div class="options">
+      <div class="field">
+        <label>程序需要输入的数据（可选）</label>
+        <textarea id="stdin" rows="2" spellcheck="false" placeholder="如果你的程序里有 input() 或 scanf()，把要输入的内容按行写在这里。&#10;例如：&#10;18&#10;小明"></textarea>
+      </div>
+
+      <div class="checkboxes">
+        <label class="chk"><input type="checkbox" id="useLLM" checked><span>用 AI 做深度讲解</span></label>
+        <label class="chk"><input type="checkbox" id="autoFix" checked><span>自动修复并验证</span></label>
+        <label class="chk"><input type="checkbox" id="autoTest" checked><span>自动边界测试</span></label>
+        <label class="chk tiny">
+          <span>超时</span>
+          <input type="number" id="timeout" value="10" min="1" max="60" class="num"> 秒
+        </label>
+      </div>
+    </div>
+
+    <button class="btn primary big" id="btnRun">
+      <span class="btn-label">开始检查代码</span>
+    </button>
+
+    <div class="tips">
+      <strong>工作原理</strong>
+      <ol>
+        <li>在你的电脑上<strong>真实运行</strong>这段代码，拿到真实报错（不是猜的）</li>
+        <li>把英文报错<strong>拆解、逐词翻译</strong>，指出具体第几行第几列</li>
+        <li>给出修复代码，并<strong>再跑一遍验证</strong>，跑不通就继续修</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ============ 右侧：结果区 ============ -->
+  <section class="pane pane-result">
+    <div class="verdict-bar" id="verdictBar">
+      <div class="verdict-icon" id="verdictIcon">?</div>
+      <div class="verdict-text">
+        <h2 id="verdictTitle">等待检查</h2>
+        <p id="verdictSub">粘贴代码后点击「开始检查代码」</p>
+      </div>
+      <div class="verdict-actions" id="verdictActions"></div>
+    </div>
+
+    <div class="tabs" id="tabs">
+      <button class="tab active" data-tab="explain">讲解</button>
+      <button class="tab" data-tab="runlog">运行现场</button>
+      <button class="tab" data-tab="fixed">修复代码</button>
+      <button class="tab" data-tab="boundary">边界测试</button>
+      <button class="tab" data-tab="static">静态预检</button>
+    </div>
+
+    <div class="tab-body">
+      <div class="tab-panel active" id="panel-explain">
+        <div class="empty">
+          <div class="empty-icon">📖</div>
+          <p>这里会显示：这条报错到底在说什么、错在哪一行、该怎么改。</p>
+        </div>
+      </div>
+
+      <div class="tab-panel" id="panel-runlog">
+        <div class="empty"><p>这里会显示真实运行的命令、输出和报错原文。</p></div>
+      </div>
+
+      <div class="tab-panel" id="panel-fixed">
+        <div class="empty"><p>这里会显示修复后的完整代码，以及「重新跑一遍」的验证结果。</p></div>
+      </div>
+
+      <div class="tab-panel" id="panel-boundary">
+        <div class="empty"><p>代码跑通后，会自动生成极端数据（空数据、0、负数、极大值）再跑一遍，检查健壮性。</p></div>
+      </div>
+
+      <div class="tab-panel" id="panel-static">
+        <div class="empty"><p>这里会显示不运行也能发现的低级错误（中文标点、括号不配对等）。</p></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ============ 设置弹窗 ============ -->
+<div class="modal" id="modalSettings">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>AI 大模型设置</h3>
+      <button class="icon-btn" data-close>×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted">
+        不填也能用——内置知识库能讲清楚 30+ 种常见报错。
+        填了之后，AI 会针对<strong>你的具体代码</strong>做逐行讲解。
+        支持任何 OpenAI 兼容接口。
+      </p>
+
+      <label>接口地址（Base URL）</label>
+      <input type="text" id="setBaseUrl" placeholder="https://api.deepseek.com/v1">
+
+      <label>模型名称</label>
+      <input type="text" id="setModel" placeholder="deepseek-chat">
+
+      <label>API Key</label>
+      <input type="password" id="setApiKey" placeholder="sk-...">
+
+      <div class="preset-row">
+        <button class="chip" data-preset="deepseek">DeepSeek</button>
+        <button class="chip" data-preset="qwen">通义千问</button>
+        <button class="chip" data-preset="moonshot">Kimi</button>
+        <button class="chip" data-preset="zhipu">智谱</button>
+        <button class="chip" data-preset="openai">OpenAI</button>
+        <button class="chip" data-preset="ollama">本地 Ollama</button>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn ghost" id="btnClearKey">清除 Key</button>
+        <button class="btn primary" id="btnSaveSettings">保存</button>
+      </div>
+      <p class="muted small" id="settingsStatus"></p>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 知识库弹窗 ============ -->
+<div class="modal" id="modalKnowledge">
+  <div class="modal-card wide">
+    <div class="modal-head">
+      <h3>常见报错百科</h3>
+      <button class="icon-btn" data-close>×</button>
+    </div>
+    <div class="modal-body">
+      <div class="kb-filters">
+        <button class="chip active" data-kb="all">全部</button>
+        <button class="chip" data-kb="python">Python</button>
+        <button class="chip" data-kb="c">C / C++</button>
+      </div>
+      <div id="kbList" class="kb-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 错题集弹窗 ============ -->
+<div class="modal" id="modalMistakes">
+  <div class="modal-card wide">
+    <div class="modal-head">
+      <h3>我的错题集 <span class="muted" id="mkCount"></span></h3>
+      <div class="row">
+        <button class="btn ghost small" id="btnExport">导出 Markdown</button>
+        <button class="icon-btn" data-close>×</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div class="kb-filters">
+        <button class="chip active" data-mk="all">全部</button>
+        <button class="chip" data-mk="todo">待复习</button>
+        <button class="chip" data-mk="done">已掌握</button>
+        <button class="chip danger-chip" id="btnClearMastered">清空已掌握</button>
+      </div>
+      <div id="mkList" class="mk-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 收藏确认弹窗 ============ -->
+<div class="modal" id="modalCollect">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>收进错题集</h3>
+      <button class="icon-btn" data-close>×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted">
+        会把这次的内容完整存下来：<strong>你的代码</strong>、<strong>真实报错</strong>、
+        <strong>病因讲解</strong>、<strong>正确写法</strong>。以后打开就能复习。
+      </p>
+
+      <label>写点笔记（可选）</label>
+      <textarea id="collectNote" rows="3" class="modal-textarea"
+        placeholder="比如：又忘了判断相等要用 == 而不是 ="></textarea>
+
+      <label>标签（可选，用逗号分隔）</label>
+      <input type="text" id="collectTags" placeholder="变量, 作用域, 循环">
+
+      <div class="modal-actions">
+        <button class="btn ghost" data-close>取消</button>
+        <button class="btn primary" id="btnConfirmCollect">确认收藏</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

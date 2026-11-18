@@ -1,0 +1,20 @@
+# 含 API Key，绝不要提交
+config.json
+
+# 运行时生成的临时目录
+workspace/
+data/
+*.exe
+*.o
+*.log
+
+# 内网穿透工具与日志
+tools/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+.idea/
+.DS_Store
