@@ -23,8 +23,9 @@
 
 设计原则：
 1. 语法/运行是否正确，只由沙盒结果决定，大模型无权推翻；
-2. 「逻辑是否正确」只有一个来源：这一次独立的 LLM 调用。
-   底层不写任何 if-else / 关键词规则去猜对错；
+2. 「逻辑是否正确」只有一个来源：这一次独立的 LLM 调用（temperature=0）；
+   代码层不猜业务对错，只用关键词做一致性兜底 —— reason 说「错」时 verdict
+   不能是 correct，reason 说「一致」时 verdict 也不能是 wrong；
 3. 没有配置 API Key 或调用失败时：
    · 默认用 MockJudgeClient 返回一份【明确标注的模拟结果】，证明裁判通路已打通；
    · 设置环境变量 JUDGE_MOCK=0 可关闭模拟，此时抛 JudgeUnavailable 如实报错。
@@ -54,29 +55,77 @@ class JudgeUnavailable(RuntimeError):
 # --------------------------------------------------------------------------- #
 # 裁判 Prompt
 # --------------------------------------------------------------------------- #
+# 裁判固定用 temperature=0：同一输入 + 同一 Prompt 必须得到同一判定。
+# 采样随机性是「同一段代码一会儿对一会儿错」的头号来源，这里不给它留口子。
+JUDGE_TEMPERATURE = 0.0
+
 JUDGE_SYSTEM_PROMPT = (
-    "你是一个严格的代码逻辑审查员，只输出 JSON，不要 Markdown、不要多余解释。\n"
-    "铁律：如果代码的实际输出与用户的描述（意图）不符，verdict 字段必须且只能输出 wrong！"
-    "绝不能输出 correct。请仔细检查你的推理和 JSON 字段是否一致。\n"
-    "示例 1（Few-shot，必须照此判定）：用户描述是「根据月份判断季节，输入6」，"
-    "代码真实输出是「春季」。6 月属于夏季，输出与意图不符，因此必须返回："
-    '{"verdict": "wrong", "reason": "6 月属于夏季，但程序输出春季，存在逻辑错误。"}\n'
-    "示例 2：用户描述是「求平均值」，代码输出恰好等于正确平均值，与意图一致，返回："
-    '{"verdict": "correct", "reason": "输出与描述的预期一致。"}\n'
-    "再次强调：verdict 必须与你 reason 中的结论一致；reason 里说存在错误/不符，"
-    "verdict 就必须是 wrong。"
+    "你是一个严格的代码逻辑审查员。你只输出一个 JSON 对象，不要 Markdown 代码块，"
+    "不要任何解释性文字（不要在 JSON 前后写「好的」「以下是结论」之类的话）。\n"
+    "\n"
+    "【判定步骤，必须按顺序做】\n"
+    "第 1 步：读【用户描述（意图）】：他想让这段代码做什么？输入是什么？\n"
+    "第 2 步：在心里算出「正确输出应该是什么」，写在心里，不要输出。\n"
+    "第 3 步：把【代码的真实运行输出】和「正确输出」逐项比对：数值、文字含义、顺序、"
+    "格式，任何一项不同都算不符合。\n"
+    "第 4 步：先写 reason（说清哪里对、哪里不对），再写 verdict。\n"
+    "\n"
+    "【不可违背的铁律】\n"
+    "铁律 1：只要真实输出与意图不符（哪怕只错一个月份、一个季度、一个小数），"
+    "verdict 必须是 wrong。\n"
+    "铁律 2：verdict 只能取 correct 或 wrong 两个值，不能是空、不能是 true/false、"
+    "不能是 unknown。\n"
+    "铁律 3：reason 里出现「错误 / 不符 / 不一致 / 应为 / 有误 / 矛盾 / 不对」"
+    "任一表述时，verdict 必须是 wrong —— 理由说了错、结论却写 correct 是绝对禁止的。\n"
+    "铁律 4：只有你能明确说出「输出与意图一致」时才允许写 correct；"
+    "拿不准时按 wrong 处理，不要因为「语法没报错」「代码写得像那么回事」就给 correct。\n"
+    "\n"
+    "【示例 1：差一个月也必须判 wrong】\n"
+    "意图：根据月份判断季节，输入3；真实输出：夏季。\n"
+    "推理：3 月属于春季，代码却输出夏季，与意图不符。\n"
+    '正确输出：{"verdict": "wrong", "reason": "3 月属于春季，但程序输出夏季，季节判断有错误。"}\n'
+    "\n"
+    "【示例 2：完全一致才判 correct】\n"
+    "意图：根据月份判断季节，输入6；真实输出：夏季。\n"
+    "推理：6 月属于夏季，输出与意图一致。\n"
+    '正确输出：{"verdict": "correct", "reason": "6 月属于夏季，输出与描述的预期一致。"}\n'
+    "\n"
+    "【示例 3：数值算错就是 wrong】\n"
+    "意图：求三个数的平均值，输入 3 个数 1 2 3；真实输出：1.5。\n"
+    "推理：正确平均值是 2.0，输出 1.5 与意图不符。\n"
+    '正确输出：{"verdict": "wrong", "reason": "1、2、3 的平均值应为 2.0，程序输出 1.5，计算有误。"}\n'
+    "\n"
+    "【示例 4：最容易犯的错，务必看懂】\n"
+    "假设你心里已经写下理由：「3 月属于春季，但程序输出夏季，与意图不符，存在逻辑错误。」\n"
+    "这时 reason 里已经有「不符」「错误」，所以 verdict 只能写 wrong。\n"
+    '正确输出：{"verdict": "wrong", "reason": "3 月属于春季，但程序输出夏季，与意图不符，存在逻辑错误。"}\n'
+    '错误示范（绝对禁止）：{"verdict": "correct", "reason": "3 月属于春季，但程序输出夏季，存在逻辑错误。"}\n'
+    "\n"
+    "【输出格式】只输出形如 "
+    '{"verdict": "correct 或 wrong", "reason": "一句话说明依据"}'
+    " 的 JSON，不要输出其他键，不要输出 JSON 以外的任何字符。"
 )
 
 # 固定模板：只把 intent 与真实输出交给大模型，不附加任何本地规则或猜测
 JUDGE_PROMPT_TEMPLATE = (
-    "你是一个严格的代码逻辑审查员。用户说这段代码的作用是：【{intent}】。"
+    "你是一个严格的代码逻辑审查员，按系统提示里的 4 条铁律判定。\n"
+    "用户说这段代码的作用是：【{intent}】。"
     "代码的真实运行结果输出是：【{actual_output}】。"
-    "请判断这个输出结果是否符合用户的预期意图？"
-    '如果符合（比如意图是求平均，输出是正确数值），返回 '
-    '{"verdict": "correct", "reason": "解释原因"}；'
-    "如果不符合（比如根据月份6应该输出夏季，但实际输出了春季），返回 "
-    '{"verdict": "wrong", "reason": "指出逻辑错误"}。只输出 JSON。'
+    "请先自己算出正确输出，再与真实输出逐项比对，最后只输出一个 JSON 对象。\n"
+    '如果符合意图（例如意图是求平均，输出等于正确平均值）：'
+    '{"verdict": "correct", "reason": "说明为什么符合"}；\n'
+    "如果不符合意图（例如根据月份 6 应该输出夏季，实际输出了春季；或数值、顺序算错）："
+    '{"verdict": "wrong", "reason": "指出是哪一步不符合"}。\n'
+    "只要 reason 里出现「错误 / 不符 / 不一致 / 应为 / 有误」等字眼，verdict 就必须是 wrong。"
 )
+
+
+def _call_judge(client: Any, prompt: str, system_prompt: str) -> LLMReply:
+    """统一以 temperature=0 调裁判；老客户端不接受该参数时退回两参数调用。"""
+    try:
+        return client.chat(prompt, system_prompt, temperature=JUDGE_TEMPERATURE)
+    except TypeError:
+        return client.chat(prompt, system_prompt)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,8 +142,9 @@ class JudgeResult:
     # 辅助排查字段
     intent: str = ""                # 本次裁判收到的用户描述
     verdict: str = ""               # correct / wrong / 空（未裁判）
-    verdict_corrected: bool = False  # verdict 与 reason 矛盾，被代码强制纠正为 wrong
+    verdict_corrected: bool = False  # verdict 与 reason 矛盾，被代码强制纠正
     reason: str = ""                # 大模型给出的原始理由
+    judge_temperature: float = JUDGE_TEMPERATURE  # 裁判调用使用的温度（固定 0）
     stage: str = ""
     language: str = ""
     language_label: str = ""
@@ -134,17 +184,22 @@ def infer_stdin(intent: str) -> str:
 # --------------------------------------------------------------------------- #
 # JSON 解析与容错
 # --------------------------------------------------------------------------- #
+_BRACE_OBJECT_RE = re.compile(r"\{[^{}]*\}")
+
+
 def parse_judge_json(text: str) -> dict[str, Any] | None:
-    """从大模型回复里取出 JSON（兼容 ```json 包裹和前后废话）。"""
+    """从大模型回复里取出 JSON（兼容 ```json 包裹、前后废话、多个 JSON）。"""
     if not text:
         return None
     raw = text.strip()
 
-    fence = re.search(r"```(?:json)?\s*(.*?)```", raw, re.S)
-    if fence:
-        raw = fence.group(1).strip()
+    candidates = [m.group(1).strip() for m in re.finditer(r"```(?:json)?\s*(.*?)```", raw, re.S)]
+    candidates.append(raw)
+    if "{" in raw:
+        candidates.append(raw[raw.find("{"): raw.rfind("}") + 1])
+    candidates.extend(m.group(0) for m in _BRACE_OBJECT_RE.finditer(raw))
 
-    for candidate in (raw, raw[raw.find("{"): raw.rfind("}") + 1] if "{" in raw else ""):
+    for candidate in candidates:
         if not candidate:
             continue
         try:
@@ -154,6 +209,160 @@ def parse_judge_json(text: str) -> dict[str, Any] | None:
         if isinstance(data, dict):
             return data
     return None
+
+
+# --------------------------------------------------------------------------- #
+# verdict 归一化：模型写 true / "Correct " / "correct。" / "正确" 都要认
+# --------------------------------------------------------------------------- #
+_VERDICT_PUNCT = " \t\r\n。.，,；;：:！!？?、\"'“”‘’（）()[]【】"
+
+_TRUE_VERDICT = (
+    "correct", "true", "yes", "ok", "pass", "passed", "right", "valid",
+    "正确", "对的", "符合", "一致", "通过",
+)
+_FALSE_VERDICT = (
+    "wrong", "false", "no", "fail", "failed", "incorrect", "invalid", "error",
+    "错误", "不对", "不符", "不一致", "有误", "不通过", "错", "否",
+)
+# 包含关系判断时，否定词优先（否则 "incorrect" 会被当成 "correct"）
+_FALSE_HINTS = (
+    "incorrect", "invalid", "wrong", "fail", "false", "notcorrect",
+    "错误", "不符", "不一致", "有误", "不对", "不通过", "错",
+)
+_TRUE_HINTS = ("correct", "true", "pass", "valid", "正确", "一致", "符合", "通过")
+
+VERDICT_KEYS = ("verdict", "is_logic_correct", "logic_correct", "correct", "passed", "result")
+REASON_KEYS = ("reason", "explanation", "detail", "why", "message", "analysis")
+
+
+def normalize_bool(value: Any) -> bool | None:
+    """把模型可能写出的各种「对 / 错」写法统一成 bool；认不出返回 None。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    text = str(value or "").strip(_VERDICT_PUNCT).lower().replace(" ", "")
+    if not text:
+        return None
+    # 先整词匹配，避免 "incorrect" 被当成 "correct"
+    if text in _TRUE_VERDICT:
+        return True
+    if text in _FALSE_VERDICT:
+        return False
+    # 整词匹配失败时按包含关系判断
+    if any(word in text for word in _FALSE_HINTS):
+        return False
+    if any(word in text for word in _TRUE_HINTS):
+        return True
+    return None
+
+
+def extract_verdict(payload: dict[str, Any]) -> bool | None:
+    """取出「逻辑是否正确」，兼容 verdict / is_logic_correct / true / "correct。" 等写法。"""
+    for key in VERDICT_KEYS:
+        if key not in payload:
+            continue
+        got = normalize_bool(payload.get(key))
+        if got is not None:
+            return got
+    return None
+
+
+def extract_reason(payload: dict[str, Any]) -> str:
+    for key in REASON_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+# --------------------------------------------------------------------------- #
+# 理由一致性校验：reason 说「错」就不能是 correct，说「一致」也不能是 wrong
+# --------------------------------------------------------------------------- #
+# 理由里出现这些词，说明模型自己已经在理由里判了「错」
+WRONG_WORDS = (
+    "错误", "不符", "不符合", "不一致", "不正确", "应为", "应该是", "有误",
+    "矛盾", "不对", "不匹配", "算错", "写错", "偏离", "报错", "崩溃", "越界",
+)
+# 理由里出现这些词，说明模型在理由里判了「对」
+CORRECT_WORDS = (
+    "正确", "一致", "符合", "无误", "没问题", "通过", "匹配", "相符",
+)
+# 只描述「逻辑」的错误词：被否定时（没有错误）反过来就是「判对」
+LOGIC_ERROR_WORDS = ("错误", "不符", "不一致", "有误", "矛盾", "不对")
+# 关键词前面出现这些否定词，就是「没有错误」这类否定句，不能算作判错
+NEGATORS = (
+    "没有", "没", "未", "不存在", "并无", "并非", "不是", "不属于",
+    "不构成", "算不上", "谈不上", "不算", "无", "非",
+)
+# 逗号也切句：否则「程序未崩溃，输出正确」里的「未」会跨句把「正确」也否定掉
+CLAUSE_SPLIT_RE = re.compile(r"[。；;！!？?，,\n]+")
+NEGATION_WINDOW = 6
+
+
+def _clauses(text: str) -> list[str]:
+    return [c.strip() for c in CLAUSE_SPLIT_RE.split(text or "") if c.strip()]
+
+
+def _has_marker(clause: str, markers: tuple[str, ...]) -> bool:
+    """分句里是否出现了「没有被否定」的关键词。"""
+    for marker in markers:
+        start = 0
+        while True:
+            idx = clause.find(marker, start)
+            if idx < 0:
+                break
+            before = clause[max(0, idx - NEGATION_WINDOW):idx]
+            if not any(neg in before for neg in NEGATORS):
+                return True
+            start = idx + len(marker)
+    return False
+
+
+def _has_negated_marker(clause: str, markers: tuple[str, ...]) -> bool:
+    """分句里是否出现了「被否定」的关键词（例如「没有错误」）。"""
+    for marker in markers:
+        start = 0
+        while True:
+            idx = clause.find(marker, start)
+            if idx < 0:
+                break
+            before = clause[max(0, idx - NEGATION_WINDOW):idx]
+            if any(neg in before for neg in NEGATORS):
+                return True
+            start = idx + len(marker)
+    return False
+
+
+def _reason_says_wrong(reason: str) -> bool:
+    """理由是否明确说了「有错」（「没有逻辑错误」这类否定句不算）。"""
+    return any(_has_marker(c, WRONG_WORDS) for c in _clauses(reason))
+
+
+def _reason_says_correct(reason: str) -> bool:
+    """理由是否明确说了「一致 / 正确」。
+
+    只要有任何一句在说有错，就不认为整体在判对；
+    「没有错误 / 不存在问题」这类否定句反过来算作判对。
+    """
+    clauses = _clauses(reason)
+    if any(_has_marker(c, WRONG_WORDS) for c in clauses):
+        return False
+    if any(_has_marker(c, CORRECT_WORDS) for c in clauses):
+        return True
+    return any(_has_negated_marker(c, LOGIC_ERROR_WORDS) for c in clauses)
+
+
+REASON_MAX_LEN = 400
+
+
+def clip_reason(reason: str) -> str:
+    """理由过长时截断，保留开头与结尾结论，避免前端刷屏。"""
+    text = (reason or "").strip()
+    if len(text) <= REASON_MAX_LEN:
+        return text
+    return f"{text[:260].rstrip()}…（理由已截断）…{text[-120:].lstrip()}"
 
 
 SEASON_BY_MONTH = {
@@ -330,7 +539,7 @@ def evaluate(
     # 情况 B：有 Key 就必须真实调用。任何失败都把原始报错抛给接口层，
     #         不再用 Mock 兜底掩盖 401 / 连接失败 / 超时 等问题。
     try:
-        reply = judge_client.chat(prompt, JUDGE_SYSTEM_PROMPT, temperature=0)
+        reply = _call_judge(judge_client, prompt, JUDGE_SYSTEM_PROMPT)
     except Exception as exc:                                  # noqa: BLE001
         res.llm_error = f"{type(exc).__name__}: {exc}"
         raise JudgeUnavailable(f"调用大模型 API 失败：{res.llm_error}", res) from exc
@@ -339,65 +548,74 @@ def evaluate(
         res.llm_error = str(getattr(reply, "error", "未知错误"))
         raise JudgeUnavailable(f"大模型 API 返回错误：{res.llm_error}", res)
 
-    payload = parse_judge_json(getattr(reply, "text", ""))
-    if payload is None:
-        res.llm_error = f"大模型返回的不是合法 JSON：{(getattr(reply, 'text', '') or '')[:300]}"
-        raise JudgeUnavailable("大模型返回的不是合法 JSON。", res)
+    raw_text = getattr(reply, "text", "") or ""
+    payload = parse_judge_json(raw_text)
+    if payload is not None:
+        logic = extract_verdict(payload)
+        reason = clip_reason(extract_reason(payload))
+    else:
+        # 模型没按格式给 JSON：先别判「未执行」，从纯文本里抽结论
+        logic = None
+        reason = clip_reason(raw_text)
 
-    verdict = str(payload.get("verdict") or "").strip().lower()
-    logic = {"correct": True, "wrong": False}.get(verdict)
+    # verdict 字段缺失或不认识时，退回「按理由本身推断」，别让整次裁判失效
     if logic is None:
-        res.llm_error = f"大模型返回 JSON 缺少合法 verdict：{str(payload)[:300]}"
-        raise JudgeUnavailable("大模型返回的 JSON 缺少合法的 verdict 字段。", res)
+        says_wrong = _reason_says_wrong(reason)
+        says_correct = _reason_says_correct(reason)
+        if says_wrong and not says_correct:
+            logic = False
+        elif says_correct and not says_wrong:
+            logic = True
 
-    reason = str(payload.get("reason") or "").strip()
+    if logic is None:
+        res.llm_error = f"大模型返回的内容里没有可识别的 verdict：{raw_text[:300]}"
+        raise JudgeUnavailable("大模型返回的内容缺少可识别的 verdict 字段。", res)
+
     if not reason:
         reason = "逻辑正确。" if logic else "逻辑与你的描述不一致，请检查判断条件。"
 
-    # 防御性纠正：reason 说「错误 / 不符 / 应为 …」但 verdict 却是 correct，
-    # 说明模型自相矛盾，强制按 reason 纠正为 wrong，避免界面显示错误结论。
-    if logic is True and _reason_says_wrong(reason):
-        verdict = "wrong"
+    # 代码层兜底拦截：verdict 必须与 reason 的结论一致，不一致时以 reason 为准。
+    # 这是最后一道闸门 —— 即使模型自相矛盾，界面也不会给出反的结论。
+    says_wrong = _reason_says_wrong(reason)
+    says_correct = _reason_says_correct(reason)
+    if logic is True and says_wrong:
         logic = False
         res.verdict_corrected = True
         reason = f"{reason}（系统检测到理由与 verdict 不一致，已自动纠正为 wrong）"
+    elif logic is False and says_correct and not says_wrong:
+        logic = True
+        res.verdict_corrected = True
+        reason = f"{reason}（系统检测到理由与 verdict 不一致，已自动纠正为 correct）"
 
-    res.verdict = verdict
+    res.verdict = "correct" if logic else "wrong"
     res.is_logic_correct = logic
     res.reason = reason
     res.feedback = reason
+    res.judge_temperature = JUDGE_TEMPERATURE
     res.judged = True
     res.judge_source = "llm"
     return res
 
 
-# reason 里出现这些词，说明模型自己在理由里已经判了「错」
-WRONG_WORDS = ("错误", "不符", "不一致", "应为", "有误", "矛盾", "不对")
-# 但「没有逻辑错误 / 未发现错误」这种否定句不能算
-NEGATED_WRONG_RE = re.compile(
-    r"(?:没有|不存在|未发现|并无|无)(?:任何|明显|重大|逻辑|语法)?的?(?:错误|问题)"
-)
-
-
-def _reason_says_wrong(reason: str) -> bool:
-    """大模型的 reason 是否明确说了「有错」。"""
-    if not reason:
-        return False
-    text = NEGATED_WRONG_RE.sub("", reason)
-    return any(word in text for word in WRONG_WORDS)
-
-
 def _mock_result(res: JudgeResult, prompt: str, note: str) -> JudgeResult:
     """无 Key 时的 Mock 裁判：结果一律带 Mock 标注，绝不冒充真实判定。"""
-    mock_reply = MockJudgeClient().chat(prompt, JUDGE_SYSTEM_PROMPT, temperature=0)
+    mock_reply = MockJudgeClient().chat(prompt, JUDGE_SYSTEM_PROMPT, temperature=JUDGE_TEMPERATURE)
     payload = parse_judge_json(mock_reply.text) or {}
-    verdict = "correct" if payload.get("verdict") == "correct" else "wrong"
-    reason = str(payload.get("reason") or "（Mock）未发现明显逻辑问题。")
+    logic = extract_verdict(payload)
+    if logic is None:
+        logic = True
+    reason = clip_reason(extract_reason(payload) or "（Mock）未发现明显逻辑问题。")
 
-    res.verdict = verdict
-    res.is_logic_correct = verdict == "correct"
+    # 与真实裁判同一条兜底规则：理由说了错，结论就不能是正确
+    if logic is True and _reason_says_wrong(reason):
+        logic = False
+        reason = f"{reason}（系统检测到理由与 verdict 不一致，已自动纠正为 wrong）"
+
+    res.verdict = "correct" if logic else "wrong"
+    res.is_logic_correct = logic
     res.reason = reason
     res.feedback = reason
+    res.judge_temperature = JUDGE_TEMPERATURE
     res.judged = True
     res.judge_source = "mock"
     res.llm_error = note
